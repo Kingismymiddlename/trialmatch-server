@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>TrialMatch — Clinical Trial Matching Engine</title>
+  <link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,600&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet"/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{min-height:100vh;background:#080c14;color:#e2e8f0;font-family:'DM Sans',system-ui,sans-serif}
+    ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.1);border-radius:2px}
+    @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+    @keyframes spin{to{transform:rotate(360deg)}}
+
+    .nav{border-bottom:1px solid rgba(255,255,255,0.06);padding:16px 28px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
+    .nav-logo{display:flex;align-items:center;gap:12px}
+    .nav-icon{width:30px;height:30px;border-radius:7px;background:rgba(99,102,241,0.15);border:1px solid rgba(99,102,241,0.3);display:flex;align-items:center;justify-content:center;font-size:15px}
+    .nav-title{font-size:14px;font-weight:500;color:#f1f5f9}
+    .nav-sub{font-size:10px;color:#334155}
+    .nav-right{display:flex;align-items:center;gap:8px}
+    .api-input{background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:6px 12px;color:#e2e8f0;font-size:11px;font-family:monospace;width:210px;outline:none}
+    .api-input:focus{border-color:rgba(99,102,241,0.4)}
+    .api-input::placeholder{color:#334155}
+    .save-btn{background:rgba(99,102,241,0.12);color:#818cf8;border:1px solid rgba(99,102,241,0.25);border-radius:6px;padding:6px 12px;cursor:pointer;font-size:11px}
+    .save-btn:hover{background:rgba(99,102,241,0.2)}
+    .key-ok{font-size:10px;color:#34d399}
+    .key-no{font-size:10px;color:#475569}
+
+    .layout{display:grid;grid-template-columns:340px 1fr;min-height:calc(100vh - 57px)}
+    .sidebar{border-right:1px solid rgba(255,255,255,0.06);padding:24px 20px;overflow-y:auto}
+    .content{padding:24px 24px;overflow-y:auto}
+
+    .section-title{font-size:10px;color:#475569;letter-spacing:0.14em;text-transform:uppercase;margin-bottom:14px}
+    .field{margin-bottom:14px}
+    .field label{display:block;font-size:11px;color:#64748b;margin-bottom:5px}
+    .field input,.field select,.field textarea{width:100%;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:7px;padding:8px 12px;color:#e2e8f0;font-size:13px;font-family:'DM Sans',system-ui,sans-serif;outline:none;transition:border-color 0.2s}
+    .field input:focus,.field select:focus,.field textarea:focus{border-color:rgba(99,102,241,0.4)}
+    .field select option{background:#0f1520}
+    .field textarea{resize:vertical;min-height:70px;line-height:1.5}
+    .match-btn{width:100%;background:rgba(99,102,241,0.12);color:#818cf8;border:1px solid rgba(99,102,241,0.3);border-radius:8px;padding:11px;cursor:pointer;font-size:13px;font-weight:500;display:flex;align-items:center;justify-content:center;gap:8px;transition:all 0.2s;margin-top:6px}
+    .match-btn:hover:not(:disabled){background:#6366f1;color:#fff;transform:translateY(-1px)}
+    .match-btn:disabled{color:#334155;border-color:rgba(255,255,255,0.05);cursor:not-allowed}
+    .spinner{width:11px;height:11px;border:1.5px solid #334155;border-top-color:#818cf8;border-radius:50%;animation:spin 0.8s linear infinite;display:inline-block}
+
+    .error-box{background:rgba(239,68,68,0.07);border:1px solid rgba(239,68,68,0.18);border-radius:8px;padding:12px 16px;color:#fca5a5;font-size:13px;margin-bottom:20px}
+    .info-box{background:rgba(99,102,241,0.06);border:1px solid rgba(99,102,241,0.15);border-radius:8px;padding:12px 16px;color:#a5b4fc;font-size:12px;margin-bottom:20px;line-height:1.6}
+
+    .results-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
+    .results-title{font-size:20px;color:#f1f5f9;font-family:'Crimson Pro',Georgia,serif;font-weight:600}
+    .results-sub{font-size:11px;color:#475569;margin-top:2px}
+    .stats-row{display:flex;gap:10px}
+    .stat-box{background:rgba(99,102,241,0.08);border:1px solid rgba(99,102,241,0.15);border-radius:8px;padding:8px 14px;text-align:center}
+    .stat-num{font-size:18px;color:#818cf8;font-weight:700;line-height:1}
+    .stat-label{font-size:10px;color:#475569;margin-top:2px}
+
+    .trial-card{background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.07);border-radius:10px;padding:18px;margin-bottom:12px;animation:fadeIn 0.4s ease both;transition:border-color 0.2s}
+    .trial-card:hover{border-color:rgba(99,102,241,0.25)}
+    .trial-header{display:flex;gap:12px;align-items:flex-start;margin-bottom:12px}
+    .score-circle{width:48px;height:48px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;flex-shrink:0}
+    .trial-title{font-size:14px;color:#e2e8f0;font-weight:500;line-height:1.4;margin-bottom:4px}
+    .trial-meta{font-size:11px;color:#475569;display:flex;gap:8px;flex-wrap:wrap}
+    .match-badge{border-radius:20px;padding:3px 10px;font-size:11px;font-weight:500;white-space:nowrap}
+    .phase-badge{background:rgba(255,255,255,0.05);color:#64748b;border-radius:4px;padding:2px 7px;font-size:10px}
+    .nct-link{color:#818cf8;text-decoration:none;font-size:10px}
+    .nct-link:hover{text-decoration:underline}
+
+    .trial-recommendation{font-size:13px;color:#94a3b8;line-height:1.65;font-family:'Crimson Pro',Georgia,serif;font-size:14px;margin-bottom:12px;padding:10px 14px;background:rgba(99,102,241,0.05);border-radius:6px;border-left:2px solid rgba(99,102,241,0.3)}
+
+    .reasons-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    .reasons-box{border-radius:7px;padding:12px}
+    .reasons-box.green{background:rgba(52,211,153,0.04);border:1px solid rgba(52,211,153,0.12)}
+    .reasons-box.yellow{background:rgba(251,191,36,0.04);border:1px solid rgba(251,191,36,0.12)}
+    .reasons-label{font-size:10px;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:8px}
+    .reasons-label.green{color:#34d399}.reasons-label.yellow{color:#fbbf24}
+    .reason-item{display:flex;gap:7px;margin-bottom:6px;font-size:12px;color:#94a3b8;line-height:1.5;align-items:flex-start}
+    .reason-dot{flex-shrink:0;margin-top:4px;width:4px;height:4px;border-radius:50%;background:currentColor}
+    .reason-dot.green{color:#34d399}.reason-dot.yellow{color:#fbbf24}
+
+    .trial-locations{font-size:11px;color:#475569;margin-top:10px}
+
+    .empty{text-align:center;padding:60px 20px;animation:fadeIn 0.6s ease}
+    .empty-icon{font-size:48px;margin-bottom:16px;opacity:0.15}
+    .empty-title{font-size:18px;font-family:'Crimson Pro',Georgia,serif;color:#475569;margin-bottom:6px}
+    .empty-sub{font-size:12px;color:#1e293b}
+
+    @media(max-width:700px){.layout{grid-template-columns:1fr}.sidebar{border-right:none;border-bottom:1px solid rgba(255,255,255,0.06)}}
+  </style>
+</head>
+<body>
+
+<div class="nav">
+  <div class="nav-logo">
+    <div class="nav-icon">🧬</div>
+    <div>
+      <div class="nav-title">TrialMatch</div>
+      <div class="nav-sub">Clinical Trial Matching Engine · ClinicalTrials.gov</div>
+    </div>
+  </div>
+  <div class="nav-right">
+    <input type="password" class="api-input" id="apiKey" placeholder="Anthropic API key (sk-ant-...)"/>
+    <button class="save-btn" onclick="saveKey()">Save</button>
+    <span id="keyStatus" class="key-no">No key</span>
+  </div>
+</div>
+
+<div class="layout">
+  <!-- Sidebar: Patient Profile -->
+  <div class="sidebar">
+    <div class="section-title">Patient Profile</div>
+
+    <div class="field">
+      <label>Age</label>
+      <input type="number" id="age" placeholder="e.g. 45" min="0" max="120"/>
+    </div>
+    <div class="field">
+      <label>Biological Sex</label>
+      <select id="sex">
+        <option value="ALL">Any</option>
+        <option value="MALE">Male</option>
+        <option value="FEMALE">Female</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Primary Condition / Diagnosis</label>
+      <input type="text" id="condition" placeholder="e.g. Type 2 Diabetes, Breast Cancer"/>
+    </div>
+    <div class="field">
+      <label>Current Medications</label>
+      <textarea id="medications" placeholder="e.g. Metformin 500mg, Lisinopril 10mg"></textarea>
+    </div>
+    <div class="field">
+      <label>Medical History</label>
+      <textarea id="history" placeholder="e.g. Hypertension, prior surgery, allergies"></textarea>
+    </div>
+    <div class="field">
+      <label>Location (City or Country)</label>
+      <input type="text" id="location" placeholder="e.g. United States, London"/>
+    </div>
+    <div class="field">
+      <label>Additional Notes</label>
+      <textarea id="notes" placeholder="e.g. Prefer oral treatments, no travel ability"></textarea>
+    </div>
+
+    <button class="match-btn" id="matchBtn" onclick="runMatch()">Find Matching Trials →</button>
+  </div>
+
+  <!-- Content: Results -->
+  <div class="content">
+    <div id="errorBox" class="error-box" style="display:none"></div>
+    <div id="infoBox" class="info-box">
+      🔑 Enter your Anthropic API key above, fill in the patient profile on the left, and click <strong>Find Matching Trials</strong>.
+      Results are pulled live from <strong>500,000+ trials</strong> on ClinicalTrials.gov.
+    </div>
+
+    <div id="resultsSection" style="display:none">
+      <div class="results-header">
+        <div>
+          <div class="results-title">Matched Trials</div>
+          <div class="results-sub" id="resultsSubtitle"></div>
+        </div>
+        <div class="stats-row">
+          <div class="stat-box">
+            <div class="stat-num" id="statTotal">0</div>
+            <div class="stat-label">trials found</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-num" id="statStrong">0</div>
+            <div class="stat-label">strong matches</div>
+          </div>
+        </div>
+      </div>
+      <div id="trialsList"></div>
+    </div>
+
+    <div class="empty" id="emptyState">
+      <div class="empty-icon">🧬</div>
+      <div class="empty-title">No results yet</div>
+      <div class="empty-sub">Fill in the patient profile and click Find Matching Trials</div>
+    </div>
+  </div>
+</div>
+
+<script>
+  let apiKey = localStorage.getItem('trialmatch_api_key') || '';
+  if (apiKey) {
+    document.getElementById('apiKey').value = apiKey;
+    document.getElementById('keyStatus').textContent = 'Key saved';
+    document.getElementById('keyStatus').className = 'key-ok';
+    document.getElementById('infoBox').style.display = 'none';
+  }
+
+  function saveKey() {
+    apiKey = document.getElementById('apiKey').value.trim();
+    if (!apiKey) return;
+    localStorage.setItem('trialmatch_api_key', apiKey);
+    document.getElementById('keyStatus').textContent = 'Key saved';
+    document.getElementById('keyStatus').className = 'key-ok';
+    document.getElementById('infoBox').style.display = 'none';
+  }
+
+  function scoreStyle(score) {
+    if (score >= 80) return {bg:'rgba(52,211,153,0.15)',color:'#34d399',border:'rgba(52,211,153,0.3)'};
+    if (score >= 50) return {bg:'rgba(251,191,36,0.15)',color:'#fbbf24',border:'rgba(251,191,36,0.3)'};
+    if (score >= 20) return {bg:'rgba(148,163,184,0.15)',color:'#94a3b8',border:'rgba(148,163,184,0.3)'};
+    return {bg:'rgba(239,68,68,0.15)',color:'#ef4444',border:'rgba(239,68,68,0.3)'};
+  }
+
+  function matchBadgeStyle(match) {
+    const map = {
+      'Strong Match':'background:rgba(52,211,153,0.12);color:#34d399;border:1px solid rgba(52,211,153,0.25)',
+      'Possible Match':'background:rgba(251,191,36,0.12);color:#fbbf24;border:1px solid rgba(251,191,36,0.25)',
+      'Weak Match':'background:rgba(148,163,184,0.12);color:#94a3b8;border:1px solid rgba(148,163,184,0.25)',
+    };
+    return map[match] || map['Weak Match'];
+  }
+
+  function renderMatches(matches, condition) {
+    const strong = matches.filter(m => m.score >= 80).length;
+    document.getElementById('statTotal').textContent = matches.length;
+    document.getElementById('statStrong').textContent = strong;
+    document.getElementById('resultsSubtitle').textContent = `Condition: ${condition}`;
+    document.getElementById('resultsSection').style.display = 'block';
+    document.getElementById('emptyState').style.display = 'none';
+
+    document.getElementById('trialsList').innerHTML = matches.map((m, i) => {
+      const s = scoreStyle(m.score);
+      const t = m.trial || {};
+      return `
+      <div class="trial-card" style="animation-delay:${i*0.06}s">
+        <div class="trial-header">
+          <div class="score-circle" style="background:${s.bg};color:${s.color};border:2px solid ${s.border}">
+            ${m.score}
+          </div>
+          <div style="flex:1">
+            <div class="trial-title">${t.title || m.nct_id}</div>
+            <div class="trial-meta">
+              <span class="match-badge" style="${matchBadgeStyle(m.match)}">${m.match}</span>
+              ${t.phase ? `<span class="phase-badge">${t.phase}</span>` : ''}
+              ${t.sponsor ? `<span style="color:#475569">${t.sponsor}</span>` : ''}
+              <a class="nct-link" href="https://clinicaltrials.gov/study/${m.nct_id}" target="_blank">${m.nct_id} ↗</a>
+            </div>
+          </div>
+        </div>
+
+        ${m.recommendation ? `<div class="trial-recommendation">${m.recommendation}</div>` : ''}
+
+        <div class="reasons-grid">
+          <div class="reasons-box green">
+            <div class="reasons-label green">Why it fits</div>
+            ${(m.reasons||[]).map(r => `<div class="reason-item"><span class="reason-dot green">●</span>${r}</div>`).join('')}
+          </div>
+          <div class="reasons-box yellow">
+            <div class="reasons-label yellow">Watch out for</div>
+            ${(m.concerns||[]).length
+              ? (m.concerns||[]).map(c => `<div class="reason-item"><span class="reason-dot yellow">●</span>${c}</div>`).join('')
+              : '<div class="reason-item" style="color:#475569">No major concerns identified</div>'
+            }
+          </div>
+        </div>
+
+        ${t.locations?.length ? `<div class="trial-locations">📍 ${t.locations.join(' · ')}</div>` : ''}
+      </div>`;
+    }).join('');
+  }
+
+  function showError(msg) {
+    const box = document.getElementById('errorBox');
+    box.textContent = '⚠ ' + msg;
+    box.style.display = 'block';
+  }
+
+  function hideError() { document.getElementById('errorBox').style.display = 'none'; }
+
+  function setRunning(loading, msg) {
+    const btn = document.getElementById('matchBtn');
+    btn.disabled = loading;
+    btn.innerHTML = loading ? `<span class="spinner"></span> ${msg}` : 'Find Matching Trials →';
+  }
+
+  async function runMatch() {
+    const condition = document.getElementById('condition').value.trim();
+    if (!condition) { showError('Please enter a condition or diagnosis.'); return; }
+    if (!apiKey) { showError('Please enter your Anthropic API key in the top right.'); return; }
+
+    hideError();
+    document.getElementById('resultsSection').style.display = 'none';
+    document.getElementById('emptyState').style.display = 'none';
+
+    const patient = {
+      age: document.getElementById('age').value || 'Not specified',
+      sex: document.getElementById('sex').value,
+      condition: condition,
+      medications: document.getElementById('medications').value || 'None',
+      history: document.getElementById('history').value || 'None',
+      location: document.getElementById('location').value || 'Any',
+      notes: document.getElementById('notes').value || 'None'
+    };
+
+    try {
+      setRunning(true, 'Searching ClinicalTrials.gov...');
+      const location = document.getElementById('location').value.trim();
+      const searchResp = await fetch(`/search-trials?condition=${encodeURIComponent(condition)}&location=${encodeURIComponent(location)}&max_results=20`);
+      if (!searchResp.ok) throw new Error('Failed to fetch trials');
+      const searchData = await searchResp.json();
+      const trials = searchData.trials || [];
+      if (!trials.length) throw new Error('No recruiting trials found for this condition. Try a broader search term.');
+
+      setRunning(true, `Matching patient profile against ${trials.length} trials with Claude...`);
+      const matchResp = await fetch('/match', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json','x-user-api-key': apiKey},
+        body: JSON.stringify({patient, trials})
+      });
+      const matchData = await matchResp.json();
+      if (matchData.error) throw new Error(matchData.error);
+
+      renderMatches(matchData.matches || [], condition);
+      setRunning(false);
+    } catch(e) {
+      showError(e.message || 'Something went wrong.');
+      setRunning(false);
+      document.getElementById('emptyState').style.display = 'block';
+    }
+  }
+</script>
+</body>
+</html>
