@@ -3,11 +3,10 @@ import re
 import json
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from typing import Optional
 
 load_dotenv()
 
@@ -22,12 +21,14 @@ app.add_middleware(
 )
 
 TRIALS_BASE = "https://clinicaltrials.gov/api/v2/studies"
-SERVER_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_BASE = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "ai": "groq/llama-3.3-70b"}
 
 
 @app.get("/search-trials")
@@ -94,57 +95,77 @@ class MatchRequest(BaseModel):
 
 
 @app.post("/match")
-async def match(req: MatchRequest, x_user_api_key: Optional[str] = Header(default=None)):
-    api_key = x_user_api_key or SERVER_API_KEY
-    if not api_key:
-        return {"error": "No API key provided. Please enter your Anthropic API key."}
+async def match(req: MatchRequest):
+    if not GROQ_API_KEY:
+        return {"error": "GROQ_API_KEY not configured on server."}
 
     patient_str = json.dumps(req.patient, indent=2)
     trials_str = "\n\n---\n\n".join([
-        f"Trial {i+1}: {t['title']}\nNCT ID: {t['nct_id']}\nPhase: {t['phase']}\nSponsor: {t['sponsor']}\nConditions: {', '.join(t['conditions'])}\nInterventions: {', '.join(t['interventions'])}\nLocations: {', '.join(t['locations'])}\nAge Range: {t['min_age']} - {t['max_age']}\nSex: {t['sex']}\nEligibility Criteria: {t['eligibility']}\nSummary: {t['summary']}"
+        f"Trial {i+1}: {t['title']}\nNCT ID: {t['nct_id']}\nPhase: {t['phase']}\nSponsor: {t['sponsor']}\nConditions: {', '.join(t['conditions'])}\nInterventions: {', '.join(t['interventions'])}\nLocations: {', '.join(t['locations'])}\nAge Range: {t['min_age']} - {t['max_age']}\nSex: {t['sex']}\nEligibility: {t['eligibility']}\nSummary: {t['summary']}"
         for i, t in enumerate(req.trials[:15])
     ])
 
+    prompt = f"""Match this patient to the most suitable clinical trials.
+
+Patient Profile:
+{patient_str}
+
+Clinical Trials:
+{trials_str}
+
+Respond with ONLY a raw JSON array starting with [ and ending with ]. No markdown, no code fences, no explanation.
+
+Each item must have:
+- nct_id: string
+- score: integer 0-100
+- match: exactly one of: Strong Match, Possible Match, Weak Match, Not Eligible
+- reasons: array of 2-3 strings explaining why it fits
+- concerns: array of 1-2 strings (or empty array)
+- recommendation: 1-2 sentence string
+
+Score labels: Strong Match (80-100), Possible Match (50-79), Weak Match (20-49), Not Eligible (0-19).
+Only include trials with score above 20. Sort by score descending. Max 8 trials."""
+
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01"
-            },
+            GROQ_BASE,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
             json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 2000,
-                "system": """You are an expert clinical trial matcher. Given a patient profile and a list of clinical trials, rank the trials by eligibility match.
-
-Return ONLY a JSON array (no markdown) like this:
-[
-  {
-    "nct_id": "NCT123456",
-    "score": 95,
-    "match": "Strong Match",
-    "reasons": ["Age fits 18-65 range", "Diagnosis matches inclusion criteria", "No conflicting medications"],
-    "concerns": ["Must discontinue current medication 2 weeks prior"],
-    "recommendation": "1-2 sentence summary of why this trial is a good fit"
-  }
-]
-
-Score from 0-100. Match labels: Strong Match (80-100), Possible Match (50-79), Weak Match (20-49), Not Eligible (0-19).
-Only return trials with score above 20. Sort by score descending. Return max 8 trials.""",
-                "messages": [{"role": "user", "content": f"Patient Profile:\n{patient_str}\n\nClinical Trials to evaluate:\n{trials_str}"}]
+                "model": GROQ_MODEL,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a JSON API. You only output raw JSON arrays with no markdown, no code fences, no explanation. Every response starts with [ and ends with ]."
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.1,
+                "max_tokens": 2000
             }
         )
         data = resp.json()
         if "error" in data:
-            return {"error": data["error"]["message"]}
+            return {"error": data["error"].get("message", "Groq API error")}
 
-        text = "".join(b["text"] for b in data.get("content", []) if b["type"] == "text")
-        match_result = re.search(r'\[[\s\S]*\]', text)
-        if not match_result:
-            return {"error": "Could not parse matching results"}
+        text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
 
-        matches = json.loads(match_result.group())
+        # Strip markdown fences
+        text = re.sub(r'^```json\s*', '', text)
+        text = re.sub(r'^```\s*', '', text)
+        text = re.sub(r'\s*```$', '', text).strip()
+
+        # Try direct parse
+        try:
+            matches = json.loads(text)
+        except Exception:
+            match_result = re.search(r'\[[\s\S]*\]', text)
+            if not match_result:
+                return {"error": f"Could not parse response: {text[:300]}"}
+            try:
+                matches = json.loads(match_result.group())
+            except Exception:
+                return {"error": f"Could not parse response: {text[:300]}"}
+
         trial_map = {t["nct_id"]: t for t in req.trials}
         for m in matches:
             m["trial"] = trial_map.get(m["nct_id"], {})
