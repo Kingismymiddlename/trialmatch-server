@@ -24,6 +24,10 @@ TRIALS_BASE = "https://clinicaltrials.gov/api/v2/studies"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_BASE = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+}
 
 
 @app.get("/health")
@@ -43,7 +47,7 @@ async def search_trials(condition: str, location: str = "", max_results: int = 2
         params["query.locn"] = location
 
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(TRIALS_BASE, params=params)
+        resp = await client.get(TRIALS_BASE, params=params, headers=BROWSER_HEADERS)
         if resp.status_code != 200:
             return {"trials": [], "error": f"ClinicalTrials.gov returned {resp.status_code}: {resp.text[:200]}"}
         data = resp.json()
