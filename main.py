@@ -36,55 +36,64 @@ async def search_trials(condition: str, location: str = "", max_results: int = 2
     params = {
         "query.cond": condition,
         "filter.overallStatus": "RECRUITING",
-        "pageSize": max_results,
-        "format": "json",
-        "fields": "NCTId,BriefTitle,BriefSummary,EligibilityCriteria,MinimumAge,MaximumAge,Sex,OverallStatus,LocationCity,LocationCountry,Phase,Condition,InterventionName,LeadSponsorName"
+        "pageSize": min(max_results, 20),
+        "format": "json"
     }
     if location:
         params["query.locn"] = location
 
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(TRIALS_BASE, params=params)
+        if resp.status_code != 200:
+            return {"trials": [], "error": f"ClinicalTrials.gov returned {resp.status_code}: {resp.text[:200]}"}
         data = resp.json()
 
     studies = data.get("studies", [])
     trials = []
+
     for s in studies:
-        pm = s.get("protocolSection", {})
-        id_mod = pm.get("identificationModule", {})
-        desc_mod = pm.get("descriptionModule", {})
-        elig_mod = pm.get("eligibilityModule", {})
-        status_mod = pm.get("statusModule", {})
-        design_mod = pm.get("designModule", {})
-        sponsor_mod = pm.get("sponsorCollaboratorsModule", {})
-        conditions_mod = pm.get("conditionsModule", {})
-        interventions_mod = pm.get("armsInterventionsModule", {})
-        contacts_mod = pm.get("contactsLocationsModule", {})
+        try:
+            pm = s.get("protocolSection", {})
+            id_mod = pm.get("identificationModule", {})
+            desc_mod = pm.get("descriptionModule", {})
+            elig_mod = pm.get("eligibilityModule", {})
+            design_mod = pm.get("designModule", {})
+            sponsor_mod = pm.get("sponsorCollaboratorsModule", {})
+            conditions_mod = pm.get("conditionsModule", {})
+            interventions_mod = pm.get("armsInterventionsModule", {})
+            contacts_mod = pm.get("contactsLocationsModule", {})
 
-        locations = []
-        for loc in contacts_mod.get("locations", [])[:3]:
-            city = loc.get("city", "")
-            country = loc.get("country", "")
-            if city or country:
-                locations.append(f"{city}, {country}".strip(", "))
+            locations = []
+            for loc in contacts_mod.get("locations", [])[:3]:
+                city = loc.get("city", "")
+                country = loc.get("country", "")
+                if city or country:
+                    locations.append(f"{city}, {country}".strip(", "))
 
-        interventions = [i.get("interventionName", "") for i in interventions_mod.get("interventions", [])[:3]]
+            interventions = []
+            for iv in interventions_mod.get("interventions", [])[:3]:
+                name = iv.get("name", "") or iv.get("interventionName", "")
+                if name:
+                    interventions.append(name)
 
-        trials.append({
-            "nct_id": id_mod.get("nctId", ""),
-            "title": id_mod.get("briefTitle", "No title"),
-            "summary": desc_mod.get("briefSummary", "")[:400],
-            "eligibility": elig_mod.get("eligibilityCriteria", "")[:600],
-            "min_age": elig_mod.get("minimumAge", ""),
-            "max_age": elig_mod.get("maximumAge", ""),
-            "sex": elig_mod.get("sex", "ALL"),
-            "status": status_mod.get("overallStatus", ""),
-            "phase": ", ".join(design_mod.get("phases", [])),
-            "sponsor": sponsor_mod.get("leadSponsor", {}).get("name", ""),
-            "conditions": conditions_mod.get("conditions", [])[:3],
-            "interventions": interventions,
-            "locations": locations,
-        })
+            phases = design_mod.get("phases", [])
+
+            trials.append({
+                "nct_id": id_mod.get("nctId", ""),
+                "title": id_mod.get("briefTitle", "No title"),
+                "summary": (desc_mod.get("briefSummary", "") or "")[:400],
+                "eligibility": (elig_mod.get("eligibilityCriteria", "") or "")[:600],
+                "min_age": elig_mod.get("minimumAge", ""),
+                "max_age": elig_mod.get("maximumAge", ""),
+                "sex": elig_mod.get("sex", "ALL"),
+                "phase": ", ".join(phases) if phases else "N/A",
+                "sponsor": sponsor_mod.get("leadSponsor", {}).get("name", ""),
+                "conditions": conditions_mod.get("conditions", [])[:3],
+                "interventions": interventions,
+                "locations": locations,
+            })
+        except Exception:
+            continue
 
     return {"trials": trials}
 
@@ -123,7 +132,7 @@ Each item must have:
 - concerns: array of 1-2 strings (or empty array)
 - recommendation: 1-2 sentence string
 
-Score labels: Strong Match (80-100), Possible Match (50-79), Weak Match (20-49), Not Eligible (0-19).
+Score labels: Strong Match (80-100), Possible Match (50-79), Weak Match (20-49).
 Only include trials with score above 20. Sort by score descending. Max 8 trials."""
 
     async with httpx.AsyncClient(timeout=60) as client:
@@ -148,13 +157,10 @@ Only include trials with score above 20. Sort by score descending. Max 8 trials.
             return {"error": data["error"].get("message", "Groq API error")}
 
         text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-
-        # Strip markdown fences
         text = re.sub(r'^```json\s*', '', text)
         text = re.sub(r'^```\s*', '', text)
         text = re.sub(r'\s*```$', '', text).strip()
 
-        # Try direct parse
         try:
             matches = json.loads(text)
         except Exception:
