@@ -100,7 +100,38 @@ async def search_trials(condition: str, location: str = "", max_results: int = 2
             continue
 
     return {"trials": trials}
+@app.get("/debug-trials")
+async def debug_trials(condition: str = "breast cancer"):
+    results = {}
+    
+    # Test ClinicalTrials.gov
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            resp = await client.get(
+                "https://clinicaltrials.gov/api/v2/studies",
+                params={"query.cond": condition, "filter.overallStatus": "RECRUITING", "pageSize": "3", "format": "json"},
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+            )
+            results["clinicaltrials_status"] = resp.status_code
+            results["clinicaltrials_preview"] = resp.text[:300]
+    except Exception as e:
+        results["clinicaltrials_error"] = str(e)
 
+    # Test NCI API
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                "https://clinicaltrialsapi.cancer.gov/api/v2/trials",
+                params={"diseases.name": condition, "current_trial_status": "Active", "size": "3"},
+                headers={"accept": "application/json"}
+            )
+            results["nci_status"] = resp.status_code
+            results["nci_preview"] = resp.text[:300]
+    except Exception as e:
+        results["nci_error"] = str(e)
+
+    return results
+```
 
 class MatchRequest(BaseModel):
     patient: dict
