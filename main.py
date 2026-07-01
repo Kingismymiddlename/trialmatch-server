@@ -9,6 +9,7 @@ from typing import Any, Dict, List
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -27,26 +28,436 @@ app.add_middleware(
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_BASE = "https://api.groq.com/openai/v1/chat/completions"
-
-# Correct replacement for deprecated llama-3.3-70b-versatile
 GROQ_MODEL = "openai/gpt-oss-120b"
 
-# NCI Clinical Trials API - cancer trials
 NCI_BASE = "https://clinicaltrialsapi.cancer.gov/api/v2/trials"
-
-# ClinicalTrials.gov API v2 fallback
 CLINICALTRIALS_BASE = "https://clinicaltrials.gov/api/v2/studies"
 
 
-@app.get("/")
-def root():
-    return {
-        "status": "ok",
-        "service": "Clinical Trials Matcher",
-        "health": "/health",
-        "search_trials": "/search-trials?condition=breast%20cancer",
-        "match": "/match",
+FRONTEND_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Trial Match</title>
+  <style>
+    * {
+      box-sizing: border-box;
     }
+
+    body {
+      margin: 0;
+      font-family: Arial, Helvetica, sans-serif;
+      background: #f4f7fb;
+      color: #172033;
+    }
+
+    .header {
+      background: linear-gradient(135deg, #1f4fd8, #0f766e);
+      color: white;
+      padding: 32px 20px;
+      text-align: center;
+    }
+
+    .header h1 {
+      margin: 0;
+      font-size: 34px;
+    }
+
+    .header p {
+      margin: 10px 0 0;
+      opacity: 0.95;
+    }
+
+    .container {
+      max-width: 1150px;
+      margin: 24px auto;
+      padding: 0 16px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+    }
+
+    @media (max-width: 850px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .card {
+      background: white;
+      border-radius: 14px;
+      padding: 20px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+      border: 1px solid #e5e7eb;
+    }
+
+    label {
+      display: block;
+      margin-top: 12px;
+      margin-bottom: 6px;
+      font-weight: 700;
+      color: #263248;
+    }
+
+    input,
+    textarea {
+      width: 100%;
+      padding: 11px;
+      border-radius: 9px;
+      border: 1px solid #cbd5e1;
+      font-size: 14px;
+      background: #fff;
+    }
+
+    textarea {
+      min-height: 230px;
+      resize: vertical;
+      font-family: Consolas, Monaco, monospace;
+    }
+
+    button {
+      margin-top: 14px;
+      padding: 12px 18px;
+      border: none;
+      border-radius: 9px;
+      background: #1f4fd8;
+      color: white;
+      font-weight: 700;
+      cursor: pointer;
+      font-size: 15px;
+    }
+
+    button:hover {
+      background: #193fb0;
+    }
+
+    button.secondary {
+      background: #0f766e;
+    }
+
+    button.secondary:hover {
+      background: #0b5f59;
+    }
+
+    .status {
+      margin-top: 12px;
+      font-size: 14px;
+      color: #475569;
+    }
+
+    .trial,
+    .match {
+      border: 1px solid #e2e8f0;
+      border-radius: 12px;
+      padding: 14px;
+      margin-top: 12px;
+      background: #fbfdff;
+    }
+
+    .trial h3,
+    .match h3 {
+      margin: 0 0 8px;
+      color: #0f172a;
+    }
+
+    .meta {
+      color: #475569;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .pill {
+      display: inline-block;
+      padding: 4px 9px;
+      border-radius: 999px;
+      background: #e0f2fe;
+      color: #075985;
+      margin: 4px 4px 4px 0;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .score {
+      font-size: 22px;
+      font-weight: 800;
+      color: #0f766e;
+    }
+
+    .error {
+      color: #b91c1c;
+      background: #fee2e2;
+      border: 1px solid #fecaca;
+      padding: 10px;
+      border-radius: 8px;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
+
+    .success {
+      color: #166534;
+      background: #dcfce7;
+      border: 1px solid #bbf7d0;
+      padding: 10px;
+      border-radius: 8px;
+      margin-top: 12px;
+    }
+
+    .full {
+      margin-top: 18px;
+    }
+
+    .small {
+      font-size: 12px;
+      color: #64748b;
+      margin-top: 8px;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>Trial Match</h1>
+    <p>Search recruiting clinical trials and match them against a patient profile using AI.</p>
+  </div>
+
+  <div class="container">
+    <div class="grid">
+      <div class="card">
+        <h2>1. Search Clinical Trials</h2>
+
+        <label for="condition">Condition</label>
+        <input id="condition" value="breast cancer" placeholder="Example: breast cancer" />
+
+        <label for="location">Location / Country</label>
+        <input id="location" value="" placeholder="Optional. Example: United States" />
+
+        <label for="maxResults">Max Results</label>
+        <input id="maxResults" type="number" min="1" max="50" value="10" />
+
+        <button onclick="searchTrials()">Search Trials</button>
+
+        <div id="searchStatus" class="status"></div>
+      </div>
+
+      <div class="card">
+        <h2>2. Patient Profile</h2>
+
+        <label for="patientProfile">Patient JSON</label>
+        <textarea id="patientProfile">{
+  "age": 55,
+  "sex": "Female",
+  "condition": "Breast cancer",
+  "stage": "Stage II",
+  "biomarkers": "HER2 positive",
+  "prior_treatments": "Surgery and chemotherapy",
+  "location": "United States",
+  "notes": "Looking for recruiting interventional trials"
+}</textarea>
+
+        <button class="secondary" onclick="matchTrials()">Match Patient to Trials</button>
+
+        <div id="matchStatus" class="status"></div>
+
+        <div class="small">
+          This tool is for research support only. It does not provide medical advice or replace clinician review.
+        </div>
+      </div>
+    </div>
+
+    <div class="card full">
+      <h2>Search Results</h2>
+      <div id="trials"></div>
+    </div>
+
+    <div class="card full">
+      <h2>AI Matches</h2>
+      <div id="matches"></div>
+    </div>
+  </div>
+
+  <script>
+    let loadedTrials = [];
+
+    function escapeHtml(value) {
+      return String(value || "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function showError(elementId, message) {
+      document.getElementById(elementId).innerHTML =
+        '<div class="error">' + escapeHtml(message) + '</div>';
+    }
+
+    function showSuccess(elementId, message) {
+      document.getElementById(elementId).innerHTML =
+        '<div class="success">' + escapeHtml(message) + '</div>';
+    }
+
+    async function searchTrials() {
+      const condition = document.getElementById("condition").value.trim();
+      const location = document.getElementById("location").value.trim();
+      const maxResults = document.getElementById("maxResults").value || 10;
+
+      if (!condition) {
+        showError("searchStatus", "Please enter a condition.");
+        return;
+      }
+
+      document.getElementById("searchStatus").innerHTML = "Searching clinical trials...";
+      document.getElementById("trials").innerHTML = "";
+      document.getElementById("matches").innerHTML = "";
+
+      try {
+        const params = new URLSearchParams({
+          condition: condition,
+          max_results: maxResults
+        });
+
+        if (location) {
+          params.append("location", location);
+        }
+
+        const response = await fetch("/search-trials?" + params.toString());
+        const data = await response.json();
+
+        if (!response.ok || data.error) {
+          throw new Error(data.error || "Search failed.");
+        }
+
+        loadedTrials = data.trials || [];
+
+        if (!loadedTrials.length) {
+          showError("searchStatus", "No trials found.");
+          return;
+        }
+
+        showSuccess("searchStatus", "Found " + loadedTrials.length + " trial(s).");
+
+        const html = loadedTrials.map((trial, index) => {
+          const conditions = (trial.conditions || []).map(c => '<span class="pill">' + escapeHtml(c) + '</span>').join("");
+          const interventions = (trial.interventions || []).map(i => '<span class="pill">' + escapeHtml(i) + '</span>').join("");
+
+          return `
+            <div class="trial">
+              <h3>${index + 1}. ${escapeHtml(trial.title)}</h3>
+              <div class="meta">
+                <b>NCT ID:</b> ${escapeHtml(trial.nct_id || "N/A")}<br/>
+                <b>Phase:</b> ${escapeHtml(trial.phase || "N/A")}<br/>
+                <b>Sponsor:</b> ${escapeHtml(trial.sponsor || "N/A")}<br/>
+                <b>Age Range:</b> ${escapeHtml(trial.min_age || "N/A")} - ${escapeHtml(trial.max_age || "N/A")}<br/>
+                <b>Sex:</b> ${escapeHtml(trial.sex || "ALL")}<br/>
+                <b>Locations:</b> ${escapeHtml((trial.locations || []).join(", ") || "N/A")}
+              </div>
+              <div>${conditions}</div>
+              <div>${interventions}</div>
+              <p>${escapeHtml(trial.summary || "")}</p>
+            </div>
+          `;
+        }).join("");
+
+        document.getElementById("trials").innerHTML = html;
+
+      } catch (error) {
+        loadedTrials = [];
+        showError("searchStatus", error.message || "Search failed.");
+      }
+    }
+
+    async function matchTrials() {
+      if (!loadedTrials.length) {
+        showError("matchStatus", "Please search trials first.");
+        return;
+      }
+
+      let patient;
+
+      try {
+        patient = JSON.parse(document.getElementById("patientProfile").value);
+      } catch (error) {
+        showError("matchStatus", "Invalid patient JSON. Please correct it.");
+        return;
+      }
+
+      document.getElementById("matchStatus").innerHTML = "Matching patient to trials...";
+      document.getElementById("matches").innerHTML = "";
+
+      try {
+        const response = await fetch("/match", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            patient: patient,
+            trials: loadedTrials
+          })
+        });
+
+        const data = await response.json();
+
+        if (!response.ok || data.error) {
+          throw new Error(data.error || "Matching failed.");
+        }
+
+        const matches = data.matches || [];
+
+        if (!matches.length) {
+          showError("matchStatus", "No suitable matches found above the score threshold.");
+          return;
+        }
+
+        showSuccess("matchStatus", "Generated " + matches.length + " match(es).");
+
+        const html = matches.map((item, index) => {
+          const reasons = (item.reasons || []).map(r => "<li>" + escapeHtml(r) + "</li>").join("");
+          const concerns = (item.concerns || []).map(c => "<li>" + escapeHtml(c) + "</li>").join("");
+          const trial = item.trial || {};
+
+          return `
+            <div class="match">
+              <h3>${index + 1}. ${escapeHtml(trial.title || item.nct_id)}</h3>
+              <div class="score">${escapeHtml(item.score)} / 100</div>
+              <div class="meta">
+                <b>Match:</b> ${escapeHtml(item.match)}<br/>
+                <b>NCT ID:</b> ${escapeHtml(item.nct_id)}
+              </div>
+
+              <h4>Reasons</h4>
+              <ul>${reasons}</ul>
+
+              <h4>Concerns</h4>
+              <ul>${concerns || "<li>No major concerns listed.</li>"}</ul>
+
+              <h4>Recommendation</h4>
+              <p>${escapeHtml(item.recommendation)}</p>
+            </div>
+          `;
+        }).join("");
+
+        document.getElementById("matches").innerHTML = html;
+
+      } catch (error) {
+        showError("matchStatus", error.message || "Matching failed.");
+      }
+    }
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def root():
+    return HTMLResponse(content=FRONTEND_HTML)
 
 
 @app.get("/health")
@@ -76,9 +487,6 @@ def safe_join(values: Any) -> str:
 
 
 def model_to_dict(model: BaseModel) -> Dict[str, Any]:
-    """
-    Compatible with both Pydantic v1 and v2.
-    """
     if hasattr(model, "model_dump"):
         return model.model_dump()
     return model.dict()
@@ -113,10 +521,6 @@ def normalize_nci_sponsor(lead_org: Any) -> str:
 
 
 def parse_model_json_object(text: str) -> Dict[str, Any]:
-    """
-    Parse JSON object from model response.
-    Uses direct parsing first, with fallback extraction if extra text appears.
-    """
     cleaned_text = text.strip()
     cleaned_text = re.sub(r"^```json\s*", "", cleaned_text)
     cleaned_text = re.sub(r"^```\s*", "", cleaned_text)
@@ -148,7 +552,6 @@ async def search_trials(
 ):
     trials: List[Dict[str, Any]] = []
 
-    # Try NCI API first.
     try:
         params: Dict[str, Any] = {
             "diseases.name": condition,
@@ -218,6 +621,7 @@ async def search_trials(
                             intervention_name = arm_interventions[0].get(
                                 "intervention_name"
                             )
+
                             if intervention_name:
                                 interventions.append(safe_str(intervention_name))
 
@@ -245,10 +649,8 @@ async def search_trials(
                     )
 
     except Exception:
-        # NCI lookup is best-effort. Fall back to ClinicalTrials.gov.
         pass
 
-    # Fallback: ClinicalTrials.gov API v2.
     if not trials:
         try:
             headers = {
@@ -587,11 +989,11 @@ Rules:
         return {"error": f"Trial matching failed: {str(e)}"}
 
 
-# Mount static frontend only if the folder exists.
+# Optional: serve additional static assets from /static if the folder exists.
 static_dir = Path("static")
 
 if static_dir.exists() and static_dir.is_dir():
-    app.mount("/app", StaticFiles(directory="static", html=True), name="static")
+    app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 if __name__ == "__main__":
