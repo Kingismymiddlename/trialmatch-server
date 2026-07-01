@@ -2,15 +2,19 @@ import os
 import re
 import json
 import httpx
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
 
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(title="Clinical Trials Matcher")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,30 +26,118 @@ app.add_middleware(
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_BASE = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
 
-# NCI Clinical Trials API - more server-friendly than ClinicalTrials.gov
+# Correct replacement for deprecated llama-3.3-70b-versatile
+GROQ_MODEL = "openai/gpt-oss-120b"
+
+# NCI Clinical Trials API - cancer trials
 NCI_BASE = "https://clinicaltrialsapi.cancer.gov/api/v2/trials"
+
+# ClinicalTrials.gov API v2 fallback
+CLINICALTRIALS_BASE = "https://clinicaltrials.gov/api/v2/studies"
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "ai": "groq/llama-3.3-70b"}
+    return {
+        "status": "ok",
+        "provider": "groq",
+        "ai": GROQ_MODEL,
+    }
+
+
+def safe_str(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def safe_join(values: Any) -> str:
+    if not values:
+        return ""
+    if isinstance(values, list):
+        return ", ".join([safe_str(v) for v in values if v])
+    return safe_str(values)
+
+
+def normalize_nci_phase(phase_value: Any) -> str:
+    if not phase_value:
+        return "N/A"
+
+    if isinstance(phase_value, dict):
+        return safe_str(phase_value.get("phase"), "N/A")
+
+    if isinstance(phase_value, list):
+        return ", ".join([safe_str(p) for p in phase_value if p]) or "N/A"
+
+    return safe_str(phase_value, "N/A")
+
+
+def normalize_nci_sponsor(lead_org: Any) -> str:
+    if not lead_org:
+        return ""
+
+    if isinstance(lead_org, dict):
+        return safe_str(
+            lead_org.get("name")
+            or lead_org.get("org_name")
+            or lead_org.get("lead_org")
+            or ""
+        )
+
+    return safe_str(lead_org)
+
+
+def parse_model_json_object(text: str) -> Dict[str, Any]:
+    """
+    Parse JSON object from model response.
+    Uses direct parsing first, with fallback extraction if extra text appears.
+    """
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+        raise ValueError("Model response was not a JSON object.")
+    except json.JSONDecodeError:
+        match = re.search(r"\{[\s\S]*\}", text)
+        if not match:
+            raise ValueError("Could not parse response as JSON object.")
+        parsed = json.loads(match.group())
+        if not isinstance(parsed, dict):
+            raise ValueError("Parsed response was not a JSON object.")
+        return parsed
 
 
 @app.get("/search-trials")
-async def search_trials(condition: str, location: str = "", max_results: int = 20):
-    # Try NCI API first (cancer trials, very reliable)
-    trials = []
+async def search_trials(
+    condition: str,
+    location: str = "",
+    max_results: int = Query(default=20, ge=1, le=50),
+):
+    trials: List[Dict[str, Any]] = []
+
+    # Try NCI API first.
     try:
-        params = {
+        params: Dict[str, Any] = {
             "diseases.name": condition,
             "current_trial_status": "Active",
             "size": min(max_results, 20),
-            "include": ["nct_id", "brief_title", "brief_summary", "eligibility",
-                        "principal_investigator", "sites", "phase", "diseases",
-                        "arms", "lead_org"]
+            "include": [
+                "nct_id",
+                "brief_title",
+                "brief_summary",
+                "eligibility",
+                "principal_investigator",
+                "sites",
+                "phase",
+                "diseases",
+                "arms",
+                "lead_org",
+            ],
         }
+
         if location:
             params["sites.org_country"] = location
 
@@ -53,115 +145,207 @@ async def search_trials(condition: str, location: str = "", max_results: int = 2
 
         async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.get(NCI_BASE, params=params, headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                for t in data.get("data", []):
-                    elig = t.get("eligibility", {})
-                    structured = elig.get("structured", {})
-                    unstructured = elig.get("unstructured", [])
-                    elig_text = " ".join([u.get("description", "") for u in unstructured])[:600]
+            resp.raise_for_status()
 
-                    sites = t.get("sites", [])[:3]
-                    locations = [f"{s.get('org_city','')}, {s.get('org_country','')}".strip(", ") for s in sites if s.get('org_city') or s.get('org_country')]
+            data = resp.json()
 
-                    arms = t.get("arms", [])[:3]
-                    interventions = [a.get("interventions", [{}])[0].get("intervention_name", "") for a in arms if a.get("interventions")]
+            for trial in data.get("data", []):
+                eligibility = trial.get("eligibility") or {}
+                structured = eligibility.get("structured") or {}
+                unstructured = eligibility.get("unstructured") or []
 
-                    diseases = [d.get("name", "") for d in t.get("diseases", [])[:3]]
+                eligibility_text = " ".join(
+                    [
+                        safe_str(item.get("description"))
+                        for item in unstructured
+                        if isinstance(item, dict)
+                    ]
+                )[:600]
 
-                    trials.append({
-                        "nct_id": t.get("nct_id", ""),
-                        "title": t.get("brief_title", "No title"),
-                        "summary": (t.get("brief_summary", "") or "")[:400],
-                        "eligibility": elig_text,
-                        "min_age": str(structured.get("min_age_in_years", "")),
-                        "max_age": str(structured.get("max_age_in_years", "")),
-                        "sex": structured.get("gender", "ALL"),
-                        "phase": t.get("phase", {}).get("phase", "N/A") if isinstance(t.get("phase"), dict) else str(t.get("phase", "N/A")),
-                        "sponsor": t.get("lead_org", ""),
+                sites = trial.get("sites") or []
+                locations = []
+
+                for site in sites[:3]:
+                    if not isinstance(site, dict):
+                        continue
+
+                    city = safe_str(site.get("org_city"))
+                    country = safe_str(site.get("org_country"))
+
+                    if city or country:
+                        locations.append(f"{city}, {country}".strip(", "))
+
+                arms = trial.get("arms") or []
+                interventions = []
+
+                for arm in arms[:3]:
+                    if not isinstance(arm, dict):
+                        continue
+
+                    arm_interventions = arm.get("interventions") or []
+
+                    if arm_interventions and isinstance(arm_interventions[0], dict):
+                        intervention_name = arm_interventions[0].get("intervention_name")
+                        if intervention_name:
+                            interventions.append(safe_str(intervention_name))
+
+                diseases = [
+                    safe_str(disease.get("name"))
+                    for disease in (trial.get("diseases") or [])[:3]
+                    if isinstance(disease, dict) and disease.get("name")
+                ]
+
+                trials.append(
+                    {
+                        "nct_id": safe_str(trial.get("nct_id")),
+                        "title": safe_str(trial.get("brief_title"), "No title"),
+                        "summary": safe_str(trial.get("brief_summary"))[:400],
+                        "eligibility": eligibility_text,
+                        "min_age": safe_str(structured.get("min_age_in_years")),
+                        "max_age": safe_str(structured.get("max_age_in_years")),
+                        "sex": safe_str(structured.get("gender"), "ALL"),
+                        "phase": normalize_nci_phase(trial.get("phase")),
+                        "sponsor": normalize_nci_sponsor(trial.get("lead_org")),
                         "conditions": diseases,
-                        "interventions": [i for i in interventions if i],
+                        "interventions": interventions,
                         "locations": locations,
-                    })
-    except Exception as e:
+                    }
+                )
+
+    except Exception:
+        # NCI enrichment is best-effort. Fall back to ClinicalTrials.gov.
         pass
 
-    # Fallback: ClinicalTrials.gov with aggressive headers
+    # Fallback: ClinicalTrials.gov API v2.
     if not trials:
         try:
             headers = {
-                "User-Agent": "Mozilla/5.0 (compatible; research-tool/1.0; +https://github.com)",
+                "User-Agent": "Mozilla/5.0 (compatible; clinical-trials-matcher/1.0)",
                 "Accept": "application/json",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Referer": "https://clinicaltrials.gov/",
             }
-            params = {
+
+            params: Dict[str, Any] = {
                 "query.cond": condition,
                 "filter.overallStatus": "RECRUITING",
                 "pageSize": min(max_results, 20),
-                "format": "json"
+                "format": "json",
             }
+
             if location:
                 params["query.locn"] = location
 
             async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
                 resp = await client.get(
-                    "https://clinicaltrials.gov/api/v2/studies",
+                    CLINICALTRIALS_BASE,
                     params=params,
-                    headers=headers
+                    headers=headers,
                 )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    for s in data.get("studies", []):
-                        try:
-                            pm = s.get("protocolSection", {})
-                            id_mod = pm.get("identificationModule", {})
-                            desc_mod = pm.get("descriptionModule", {})
-                            elig_mod = pm.get("eligibilityModule", {})
-                            design_mod = pm.get("designModule", {})
-                            sponsor_mod = pm.get("sponsorCollaboratorsModule", {})
-                            conditions_mod = pm.get("conditionsModule", {})
-                            interventions_mod = pm.get("armsInterventionsModule", {})
-                            contacts_mod = pm.get("contactsLocationsModule", {})
+                resp.raise_for_status()
 
-                            locations = []
-                            for loc in contacts_mod.get("locations", [])[:3]:
-                                city = loc.get("city", "")
-                                country = loc.get("country", "")
-                                if city or country:
-                                    locations.append(f"{city}, {country}".strip(", "))
+                data = resp.json()
 
-                            interventions = [iv.get("name", "") for iv in interventions_mod.get("interventions", [])[:3] if iv.get("name")]
-                            phases = design_mod.get("phases", [])
+                for study in data.get("studies", []):
+                    try:
+                        protocol = study.get("protocolSection") or {}
 
-                            trials.append({
-                                "nct_id": id_mod.get("nctId", ""),
-                                "title": id_mod.get("briefTitle", "No title"),
-                                "summary": (desc_mod.get("briefSummary", "") or "")[:400],
-                                "eligibility": (elig_mod.get("eligibilityCriteria", "") or "")[:600],
-                                "min_age": elig_mod.get("minimumAge", ""),
-                                "max_age": elig_mod.get("maximumAge", ""),
-                                "sex": elig_mod.get("sex", "ALL"),
-                                "phase": ", ".join(phases) if phases else "N/A",
-                                "sponsor": sponsor_mod.get("leadSponsor", {}).get("name", ""),
-                                "conditions": conditions_mod.get("conditions", [])[:3],
+                        identification_module = protocol.get("identificationModule") or {}
+                        description_module = protocol.get("descriptionModule") or {}
+                        eligibility_module = protocol.get("eligibilityModule") or {}
+                        design_module = protocol.get("designModule") or {}
+                        sponsor_module = protocol.get("sponsorCollaboratorsModule") or {}
+                        conditions_module = protocol.get("conditionsModule") or {}
+                        interventions_module = protocol.get("armsInterventionsModule") or {}
+                        contacts_module = protocol.get("contactsLocationsModule") or {}
+
+                        locations = []
+
+                        for loc in (contacts_module.get("locations") or [])[:3]:
+                            city = safe_str(loc.get("city"))
+                            country = safe_str(loc.get("country"))
+
+                            if city or country:
+                                locations.append(f"{city}, {country}".strip(", "))
+
+                        interventions = [
+                            safe_str(intervention.get("name"))
+                            for intervention in (
+                                interventions_module.get("interventions") or []
+                            )[:3]
+                            if intervention.get("name")
+                        ]
+
+                        phases = design_module.get("phases") or []
+
+                        trials.append(
+                            {
+                                "nct_id": safe_str(identification_module.get("nctId")),
+                                "title": safe_str(
+                                    identification_module.get("briefTitle"),
+                                    "No title",
+                                ),
+                                "summary": safe_str(
+                                    description_module.get("briefSummary")
+                                )[:400],
+                                "eligibility": safe_str(
+                                    eligibility_module.get("eligibilityCriteria")
+                                )[:600],
+                                "min_age": safe_str(
+                                    eligibility_module.get("minimumAge")
+                                ),
+                                "max_age": safe_str(
+                                    eligibility_module.get("maximumAge")
+                                ),
+                                "sex": safe_str(
+                                    eligibility_module.get("sex"),
+                                    "ALL",
+                                ),
+                                "phase": safe_join(phases) if phases else "N/A",
+                                "sponsor": safe_str(
+                                    sponsor_module.get("leadSponsor", {}).get("name")
+                                ),
+                                "conditions": (
+                                    conditions_module.get("conditions") or []
+                                )[:3],
                                 "interventions": interventions,
                                 "locations": locations,
-                            })
-                        except Exception:
-                            continue
+                            }
+                        )
+
+                    except Exception:
+                        continue
+
         except Exception:
             pass
 
     if not trials:
-        return {"trials": [], "error": "Could not fetch trials from any source. Please try again."}
+        return {
+            "trials": [],
+            "error": "Could not fetch trials from any source. Please try again.",
+        }
 
     return {"trials": trials}
 
 
+class ClinicalTrial(BaseModel):
+    nct_id: str = ""
+    title: str = "No title"
+    summary: str = ""
+    eligibility: str = ""
+    min_age: str = ""
+    max_age: str = ""
+    sex: str = "ALL"
+    phase: str = "N/A"
+    sponsor: str = ""
+    conditions: List[str] = Field(default_factory=list)
+    interventions: List[str] = Field(default_factory=list)
+    locations: List[str] = Field(default_factory=list)
+
+
 class MatchRequest(BaseModel):
-    patient: dict
-    trials: list
+    patient: Dict[str, Any]
+    trials: List[ClinicalTrial]
 
 
 @app.post("/match")
@@ -169,13 +353,32 @@ async def match(req: MatchRequest):
     if not GROQ_API_KEY:
         return {"error": "GROQ_API_KEY not configured on server."}
 
-    patient_str = json.dumps(req.patient, indent=2)
-    trials_str = "\n\n---\n\n".join([
-        f"Trial {i+1}: {t['title']}\nNCT ID: {t['nct_id']}\nPhase: {t['phase']}\nSponsor: {t['sponsor']}\nConditions: {', '.join(t['conditions'])}\nInterventions: {', '.join(t['interventions'])}\nLocations: {', '.join(t['locations'])}\nAge Range: {t['min_age']} - {t['max_age']}\nSex: {t['sex']}\nEligibility: {t['eligibility']}\nSummary: {t['summary']}"
-        for i, t in enumerate(req.trials[:15])
-    ])
+    if not req.trials:
+        return {"error": "No trials provided for matching."}
 
-    prompt = f"""Match this patient to the most suitable clinical trials.
+    patient_str = json.dumps(req.patient, indent=2)
+
+    trials_str = "\n\n---\n\n".join(
+        [
+            (
+                f"Trial {index + 1}: {trial.title}\n"
+                f"NCT ID: {trial.nct_id}\n"
+                f"Phase: {trial.phase}\n"
+                f"Sponsor: {trial.sponsor}\n"
+                f"Conditions: {', '.join(trial.conditions)}\n"
+                f"Interventions: {', '.join(trial.interventions)}\n"
+                f"Locations: {', '.join(trial.locations)}\n"
+                f"Age Range: {trial.min_age or 'N/A'} - {trial.max_age or 'N/A'}\n"
+                f"Sex: {trial.sex}\n"
+                f"Eligibility: {trial.eligibility}\n"
+                f"Summary: {trial.summary}"
+            )
+            for index, trial in enumerate(req.trials[:15])
+        ]
+    )
+
+    prompt = f"""
+Match this patient to the most suitable clinical trials.
 
 Patient Profile:
 {patient_str}
@@ -183,57 +386,159 @@ Patient Profile:
 Clinical Trials:
 {trials_str}
 
-Respond with ONLY a raw JSON array starting with [ and ending with ]. No markdown, no code fences, no explanation.
+Return ONLY a valid JSON object with this exact structure:
+{{
+  "matches": [
+    {{
+      "nct_id": "string",
+      "score": 0,
+      "match": "Strong Match OR Possible Match OR Weak Match",
+      "reasons": ["reason 1", "reason 2"],
+      "concerns": ["concern 1"],
+      "recommendation": "1-2 sentence recommendation"
+    }}
+  ]
+}}
 
-Each item must have:
-- nct_id: string
-- score: integer 0-100
-- match: exactly one of: Strong Match, Possible Match, Weak Match
-- reasons: array of 2-3 strings explaining why it fits
-- concerns: array of 0-2 strings
-- recommendation: 1-2 sentence string
+Rules:
+- The "score" must be an integer from 0 to 100.
+- The "match" value must be exactly one of: "Strong Match", "Possible Match", "Weak Match".
+- The "reasons" array must contain 2-3 strings.
+- The "concerns" array must contain 0-2 strings.
+- Only include trials with score above 20.
+- Include maximum 8 trials.
+- Sort matches by score descending.
+- Do not include markdown.
+- Do not include backticks.
+- Do not include text before or after the JSON object.
+""".strip()
 
-Sort by score descending. Only include score above 20. Max 8 trials."""
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                GROQ_BASE,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a clinical trial matching JSON API. "
+                                "Output only valid JSON objects. Do not output markdown."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt,
+                        },
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 2000,
+                    "response_format": {"type": "json_object"},
+                },
+            )
+            resp.raise_for_status()
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(
-            GROQ_BASE,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": GROQ_MODEL,
-                "messages": [
-                    {"role": "system", "content": "You are a JSON API. Output only raw JSON arrays. No markdown. No explanation. Start with [ end with ]."},
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": 0.1,
-                "max_tokens": 2000
-            }
-        )
-        data = resp.json()
-        if "error" in data:
-            return {"error": data["error"].get("message", "Groq API error")}
+            data = resp.json()
 
-        text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-        text = re.sub(r'^```json\s*', '', text)
-        text = re.sub(r'^```\s*', '', text)
-        text = re.sub(r'\s*```$', '', text).strip()
+            if "error" in data:
+                return {
+                    "error": data["error"].get("message", "Groq API error")
+                }
 
-        try:
-            matches = json.loads(text)
-        except Exception:
-            m = re.search(r'\[[\s\S]*\]', text)
-            if not m:
-                return {"error": f"Could not parse response: {text[:300]}"}
-            try:
-                matches = json.loads(m.group())
-            except Exception:
-                return {"error": f"Could not parse response: {text[:300]}"}
+            text = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
 
-        trial_map = {t["nct_id"]: t for t in req.trials}
-        for m in matches:
-            m["trial"] = trial_map.get(m["nct_id"], {})
+            if not text:
+                return {"error": "Empty response from model."}
 
-        return {"matches": matches}
+            parsed = parse_model_json_object(text)
+            matches = parsed.get("matches", [])
+
+            if not isinstance(matches, list):
+                return {"error": "Model response did not contain a valid matches array."}
+
+            trial_map = {trial.nct_id: trial.model_dump() for trial in req.trials}
+
+            cleaned_matches = []
+
+            for item in matches:
+                if not isinstance(item, dict):
+                    continue
+
+                nct_id = safe_str(item.get("nct_id"))
+                score = item.get("score", 0)
+
+                try:
+                    score = int(score)
+                except Exception:
+                    score = 0
+
+                if score <= 20:
+                    continue
+
+                match_label = safe_str(item.get("match"))
+
+                if match_label not in {
+                    "Strong Match",
+                    "Possible Match",
+                    "Weak Match",
+                }:
+                    match_label = (
+                        "Strong Match"
+                        if score >= 75
+                        else "Possible Match"
+                        if score >= 45
+                        else "Weak Match"
+                    )
+
+                reasons = item.get("reasons", [])
+                concerns = item.get("concerns", [])
+
+                if not isinstance(reasons, list):
+                    reasons = [safe_str(reasons)] if reasons else []
+
+                if not isinstance(concerns, list):
+                    concerns = [safe_str(concerns)] if concerns else []
+
+                cleaned_matches.append(
+                    {
+                        "nct_id": nct_id,
+                        "score": max(0, min(score, 100)),
+                        "match": match_label,
+                        "reasons": [safe_str(reason) for reason in reasons[:3]],
+                        "concerns": [safe_str(concern) for concern in concerns[:2]],
+                        "recommendation": safe_str(item.get("recommendation")),
+                        "trial": trial_map.get(nct_id, {}),
+                    }
+                )
+
+            cleaned_matches.sort(key=lambda item: item["score"], reverse=True)
+
+            return {"matches": cleaned_matches[:8]}
+
+    except httpx.HTTPStatusError as e:
+        return {
+            "error": f"Groq API HTTP error: {e.response.status_code}",
+            "details": e.response.text,
+        }
+    except json.JSONDecodeError:
+        return {"error": "Model returned invalid JSON."}
+    except Exception as e:
+        return {"error": f"Trial matching failed: {str(e)}"}
 
 
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
+# Mount static frontend only if the folder exists.
+# This prevents deployment crash when static/ is missing.
+static_dir = Path("static")
+
+if static_dir.exists() and static_dir.is_dir():
+    app.mount("/", StaticFiles(directory="static", html=True), name="static")
