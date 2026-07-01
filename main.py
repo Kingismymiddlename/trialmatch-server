@@ -2,8 +2,9 @@ import os
 import re
 import json
 import httpx
+import uvicorn
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query
@@ -37,12 +38,24 @@ NCI_BASE = "https://clinicaltrialsapi.cancer.gov/api/v2/trials"
 CLINICALTRIALS_BASE = "https://clinicaltrials.gov/api/v2/studies"
 
 
+@app.get("/")
+def root():
+    return {
+        "status": "ok",
+        "service": "Clinical Trials Matcher",
+        "health": "/health",
+        "search_trials": "/search-trials?condition=breast%20cancer",
+        "match": "/match",
+    }
+
+
 @app.get("/health")
 def health():
     return {
         "status": "ok",
         "provider": "groq",
         "ai": GROQ_MODEL,
+        "groq_key_configured": bool(GROQ_API_KEY),
     }
 
 
@@ -60,6 +73,15 @@ def safe_join(values: Any) -> str:
     if isinstance(values, list):
         return ", ".join([safe_str(v) for v in values if v])
     return safe_str(values)
+
+
+def model_to_dict(model: BaseModel) -> Dict[str, Any]:
+    """
+    Compatible with both Pydantic v1 and v2.
+    """
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
 
 
 def normalize_nci_phase(phase_value: Any) -> str:
@@ -95,18 +117,26 @@ def parse_model_json_object(text: str) -> Dict[str, Any]:
     Parse JSON object from model response.
     Uses direct parsing first, with fallback extraction if extra text appears.
     """
+    cleaned_text = text.strip()
+    cleaned_text = re.sub(r"^```json\s*", "", cleaned_text)
+    cleaned_text = re.sub(r"^```\s*", "", cleaned_text)
+    cleaned_text = re.sub(r"\s*```$", "", cleaned_text).strip()
+
     try:
-        parsed = json.loads(text)
+        parsed = json.loads(cleaned_text)
         if isinstance(parsed, dict):
             return parsed
         raise ValueError("Model response was not a JSON object.")
     except json.JSONDecodeError:
-        match = re.search(r"\{[\s\S]*\}", text)
+        match = re.search(r"\{[\s\S]*\}", cleaned_text)
         if not match:
             raise ValueError("Could not parse response as JSON object.")
+
         parsed = json.loads(match.group())
+
         if not isinstance(parsed, dict):
             raise ValueError("Parsed response was not a JSON object.")
+
         return parsed
 
 
@@ -145,75 +175,77 @@ async def search_trials(
 
         async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.get(NCI_BASE, params=params, headers=headers)
-            resp.raise_for_status()
 
-            data = resp.json()
+            if resp.status_code == 200:
+                data = resp.json()
 
-            for trial in data.get("data", []):
-                eligibility = trial.get("eligibility") or {}
-                structured = eligibility.get("structured") or {}
-                unstructured = eligibility.get("unstructured") or []
+                for trial in data.get("data", []):
+                    eligibility = trial.get("eligibility") or {}
+                    structured = eligibility.get("structured") or {}
+                    unstructured = eligibility.get("unstructured") or []
 
-                eligibility_text = " ".join(
-                    [
-                        safe_str(item.get("description"))
-                        for item in unstructured
-                        if isinstance(item, dict)
+                    eligibility_text = " ".join(
+                        [
+                            safe_str(item.get("description"))
+                            for item in unstructured
+                            if isinstance(item, dict)
+                        ]
+                    )[:600]
+
+                    sites = trial.get("sites") or []
+                    locations = []
+
+                    for site in sites[:3]:
+                        if not isinstance(site, dict):
+                            continue
+
+                        city = safe_str(site.get("org_city"))
+                        country = safe_str(site.get("org_country"))
+
+                        if city or country:
+                            locations.append(f"{city}, {country}".strip(", "))
+
+                    arms = trial.get("arms") or []
+                    interventions = []
+
+                    for arm in arms[:3]:
+                        if not isinstance(arm, dict):
+                            continue
+
+                        arm_interventions = arm.get("interventions") or []
+
+                        if arm_interventions and isinstance(arm_interventions[0], dict):
+                            intervention_name = arm_interventions[0].get(
+                                "intervention_name"
+                            )
+                            if intervention_name:
+                                interventions.append(safe_str(intervention_name))
+
+                    diseases = [
+                        safe_str(disease.get("name"))
+                        for disease in (trial.get("diseases") or [])[:3]
+                        if isinstance(disease, dict) and disease.get("name")
                     ]
-                )[:600]
 
-                sites = trial.get("sites") or []
-                locations = []
-
-                for site in sites[:3]:
-                    if not isinstance(site, dict):
-                        continue
-
-                    city = safe_str(site.get("org_city"))
-                    country = safe_str(site.get("org_country"))
-
-                    if city or country:
-                        locations.append(f"{city}, {country}".strip(", "))
-
-                arms = trial.get("arms") or []
-                interventions = []
-
-                for arm in arms[:3]:
-                    if not isinstance(arm, dict):
-                        continue
-
-                    arm_interventions = arm.get("interventions") or []
-
-                    if arm_interventions and isinstance(arm_interventions[0], dict):
-                        intervention_name = arm_interventions[0].get("intervention_name")
-                        if intervention_name:
-                            interventions.append(safe_str(intervention_name))
-
-                diseases = [
-                    safe_str(disease.get("name"))
-                    for disease in (trial.get("diseases") or [])[:3]
-                    if isinstance(disease, dict) and disease.get("name")
-                ]
-
-                trials.append(
-                    {
-                        "nct_id": safe_str(trial.get("nct_id")),
-                        "title": safe_str(trial.get("brief_title"), "No title"),
-                        "summary": safe_str(trial.get("brief_summary"))[:400],
-                        "eligibility": eligibility_text,
-                        "min_age": safe_str(structured.get("min_age_in_years")),
-                        "max_age": safe_str(structured.get("max_age_in_years")),
-                        "sex": safe_str(structured.get("gender"), "ALL"),
-                        "phase": normalize_nci_phase(trial.get("phase")),
-                        "sponsor": normalize_nci_sponsor(trial.get("lead_org")),
-                        "conditions": diseases,
-                        "interventions": interventions,
-                        "locations": locations,
-                    }
-                )
+                    trials.append(
+                        {
+                            "nct_id": safe_str(trial.get("nct_id")),
+                            "title": safe_str(trial.get("brief_title"), "No title"),
+                            "summary": safe_str(trial.get("brief_summary"))[:400],
+                            "eligibility": eligibility_text,
+                            "min_age": safe_str(structured.get("min_age_in_years")),
+                            "max_age": safe_str(structured.get("max_age_in_years")),
+                            "sex": safe_str(structured.get("gender"), "ALL"),
+                            "phase": normalize_nci_phase(trial.get("phase")),
+                            "sponsor": normalize_nci_sponsor(trial.get("lead_org")),
+                            "conditions": diseases,
+                            "interventions": interventions,
+                            "locations": locations,
+                        }
+                    )
 
     except Exception:
-        # NCI enrichment is best-effort. Fall back to ClinicalTrials.gov.
+        # NCI lookup is best-effort. Fall back to ClinicalTrials.gov.
         pass
 
     # Fallback: ClinicalTrials.gov API v2.
@@ -242,79 +274,93 @@ async def search_trials(
                     params=params,
                     headers=headers,
                 )
-                resp.raise_for_status()
 
-                data = resp.json()
+                if resp.status_code == 200:
+                    data = resp.json()
 
-                for study in data.get("studies", []):
-                    try:
-                        protocol = study.get("protocolSection") or {}
+                    for study in data.get("studies", []):
+                        try:
+                            protocol = study.get("protocolSection") or {}
 
-                        identification_module = protocol.get("identificationModule") or {}
-                        description_module = protocol.get("descriptionModule") or {}
-                        eligibility_module = protocol.get("eligibilityModule") or {}
-                        design_module = protocol.get("designModule") or {}
-                        sponsor_module = protocol.get("sponsorCollaboratorsModule") or {}
-                        conditions_module = protocol.get("conditionsModule") or {}
-                        interventions_module = protocol.get("armsInterventionsModule") or {}
-                        contacts_module = protocol.get("contactsLocationsModule") or {}
+                            identification_module = (
+                                protocol.get("identificationModule") or {}
+                            )
+                            description_module = protocol.get("descriptionModule") or {}
+                            eligibility_module = protocol.get("eligibilityModule") or {}
+                            design_module = protocol.get("designModule") or {}
+                            sponsor_module = (
+                                protocol.get("sponsorCollaboratorsModule") or {}
+                            )
+                            conditions_module = protocol.get("conditionsModule") or {}
+                            interventions_module = (
+                                protocol.get("armsInterventionsModule") or {}
+                            )
+                            contacts_module = (
+                                protocol.get("contactsLocationsModule") or {}
+                            )
 
-                        locations = []
+                            locations = []
 
-                        for loc in (contacts_module.get("locations") or [])[:3]:
-                            city = safe_str(loc.get("city"))
-                            country = safe_str(loc.get("country"))
+                            for loc in (contacts_module.get("locations") or [])[:3]:
+                                city = safe_str(loc.get("city"))
+                                country = safe_str(loc.get("country"))
 
-                            if city or country:
-                                locations.append(f"{city}, {country}".strip(", "))
+                                if city or country:
+                                    locations.append(
+                                        f"{city}, {country}".strip(", ")
+                                    )
 
-                        interventions = [
-                            safe_str(intervention.get("name"))
-                            for intervention in (
-                                interventions_module.get("interventions") or []
-                            )[:3]
-                            if intervention.get("name")
-                        ]
+                            interventions = [
+                                safe_str(intervention.get("name"))
+                                for intervention in (
+                                    interventions_module.get("interventions") or []
+                                )[:3]
+                                if intervention.get("name")
+                            ]
 
-                        phases = design_module.get("phases") or []
+                            phases = design_module.get("phases") or []
 
-                        trials.append(
-                            {
-                                "nct_id": safe_str(identification_module.get("nctId")),
-                                "title": safe_str(
-                                    identification_module.get("briefTitle"),
-                                    "No title",
-                                ),
-                                "summary": safe_str(
-                                    description_module.get("briefSummary")
-                                )[:400],
-                                "eligibility": safe_str(
-                                    eligibility_module.get("eligibilityCriteria")
-                                )[:600],
-                                "min_age": safe_str(
-                                    eligibility_module.get("minimumAge")
-                                ),
-                                "max_age": safe_str(
-                                    eligibility_module.get("maximumAge")
-                                ),
-                                "sex": safe_str(
-                                    eligibility_module.get("sex"),
-                                    "ALL",
-                                ),
-                                "phase": safe_join(phases) if phases else "N/A",
-                                "sponsor": safe_str(
-                                    sponsor_module.get("leadSponsor", {}).get("name")
-                                ),
-                                "conditions": (
-                                    conditions_module.get("conditions") or []
-                                )[:3],
-                                "interventions": interventions,
-                                "locations": locations,
-                            }
-                        )
+                            trials.append(
+                                {
+                                    "nct_id": safe_str(
+                                        identification_module.get("nctId")
+                                    ),
+                                    "title": safe_str(
+                                        identification_module.get("briefTitle"),
+                                        "No title",
+                                    ),
+                                    "summary": safe_str(
+                                        description_module.get("briefSummary")
+                                    )[:400],
+                                    "eligibility": safe_str(
+                                        eligibility_module.get("eligibilityCriteria")
+                                    )[:600],
+                                    "min_age": safe_str(
+                                        eligibility_module.get("minimumAge")
+                                    ),
+                                    "max_age": safe_str(
+                                        eligibility_module.get("maximumAge")
+                                    ),
+                                    "sex": safe_str(
+                                        eligibility_module.get("sex"),
+                                        "ALL",
+                                    ),
+                                    "phase": safe_join(phases) if phases else "N/A",
+                                    "sponsor": safe_str(
+                                        sponsor_module.get("leadSponsor", {}).get(
+                                            "name"
+                                        )
+                                    ),
+                                    "conditions": (
+                                        conditions_module.get("conditions") or []
+                                    )[:3],
+                                    "interventions": interventions,
+                                    "locations": locations,
+                                }
+                            )
 
-                    except Exception:
-                        continue
+                        except Exception:
+                            continue
 
         except Exception:
             pass
@@ -441,8 +487,8 @@ Rules:
                     "response_format": {"type": "json_object"},
                 },
             )
-            resp.raise_for_status()
 
+            resp.raise_for_status()
             data = resp.json()
 
             if "error" in data:
@@ -464,9 +510,14 @@ Rules:
             matches = parsed.get("matches", [])
 
             if not isinstance(matches, list):
-                return {"error": "Model response did not contain a valid matches array."}
+                return {
+                    "error": "Model response did not contain a valid matches array."
+                }
 
-            trial_map = {trial.nct_id: trial.model_dump() for trial in req.trials}
+            trial_map = {
+                trial.nct_id: model_to_dict(trial)
+                for trial in req.trials
+            }
 
             cleaned_matches = []
 
@@ -537,8 +588,12 @@ Rules:
 
 
 # Mount static frontend only if the folder exists.
-# This prevents deployment crash when static/ is missing.
 static_dir = Path("static")
 
 if static_dir.exists() and static_dir.is_dir():
-    app.mount("/", StaticFiles(directory="static", html=True), name="static")
+    app.mount("/app", StaticFiles(directory="static", html=True), name="static")
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "10000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
